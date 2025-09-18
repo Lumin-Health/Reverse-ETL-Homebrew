@@ -105,3 +105,51 @@ Before proceeding to Act mode, please ensure the following:
 *   **Hubspot API Key**: Ensure the Hubspot API key has the necessary scopes: `crm.objects.contacts.read`, `crm.objects.contacts.write`, `crm.objects.custom_objects.read`, `crm.objects.custom_objects.write`.
 *   **GCP Permissions**: Provide necessary permissions for enabling Google Cloud APIs (Cloud Functions, Cloud Scheduler, Secret Manager, BigQuery) and creating/configuring service accounts with appropriate IAM roles in the `lumininternal` project.
 *   **Hubspot Custom Property**: Confirm that the custom property `property_amd_template_id` has been created in your Hubspot instance.
+
+## Production Hardening (added)
+
+This implementation now includes:
+- **Idempotent upserts** via a BigQuery ID map table: `{ID_MAP_TABLE}`
+- **Checkpointing** in a run ledger: `{RUN_LEDGER_TABLE}` (advances a high-watermark for delta reads)
+- **Dead-letter queue**: `{DLQ_TABLE}` for records that fail after retries or are ambiguous
+- **Structured logs**: JSON logs with PHI minimization (emails/names/addresses/DOB are hashed in logs)
+- **Adaptive retries** against HubSpot 429/5xx with exponential backoff
+- **Ambiguity guardrails**: if multiple HubSpot matches are found or no email is provided for an unmapped contact, the record is quarantined to DLQ
+- **Batching**: configurable `BATCH_SIZE` for stable API throughput
+
+### Environment variables
+Key variables (with defaults):
+```
+GCP_PROJECT_ID=lumininternal
+BIGQUERY_PATIENT_TABLE=lumininternal.amd.PatientsWithStatistics
+BIGQUERY_ROI_TABLE=lumininternal.amd.ROIs
+PATIENT_UPDATED_AT_COL=updated_at
+ROI_UPDATED_AT_COL=updated_at
+BQ_DATASET=etl
+RUN_LEDGER_TABLE=lumininternal.etl.reverse_etl_run_ledger
+DLQ_TABLE=lumininternal.etl.reverse_etl_dlq
+ID_MAP_TABLE=lumininternal.etl.hubspot_id_map
+HUBSPOT_API_SECRET_NAME=HubspotApiKey
+HUBSPOT_BASE=https://api.hubapi.com
+BATCH_SIZE=50
+MAX_RETRIES=5
+INITIAL_BACKOFF=0.5
+ROI_OBJECT_TYPE=p_roi
+PATIENT_NATURAL_ID_PROP=amd_patient_id
+ROI_NATURAL_ID_PROP=roi_id
+```
+
+### BigQuery
+Create (or let the job auto-create) the control tables in dataset `${BQ_DATASET}`:
+- `reverse_etl_run_ledger` – progress and high-watermark
+- `hubspot_id_map` – natural key → hubspot id
+- `reverse_etl_dlq` – failures & ambiguities
+
+> If your source tables **do not** have an `updated_at` column, the job will do a full scan. Add the column and populate it to enable delta syncs.
+
+### Cloud Functions
+Deploy two HTTP functions:
+- `sync_patients`
+- `sync_rois`
+
+Trigger them on a daily schedule from Cloud Scheduler.
