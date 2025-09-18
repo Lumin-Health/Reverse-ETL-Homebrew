@@ -344,6 +344,42 @@ def map_roi_to_custom(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
     props = {k:v for k,v in props.items() if v not in (None,"")}
     return natural_key, props
 
+def normalize_text(value: Optional[Any]) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip().lower()
+    return " ".join(text.split())
+
+def normalize_dob(value: Optional[Any]) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+        return parsed.date().isoformat()
+    except ValueError:
+        if " " in text:
+            return text.split(" ", 1)[0]
+        return text
+
+def addresses_match(source: Dict[str,Any], candidate: Dict[str,Any]) -> bool:
+    field_map = [
+        ("address", "address"),
+        ("city", "city"),
+        ("state", "state"),
+        ("zip", "zip"),
+    ]
+    for src_field, cand_field in field_map:
+        src_val = source.get(src_field)
+        cand_val = candidate.get(cand_field)
+        if src_val and cand_val and normalize_text(src_val) != normalize_text(cand_val):
+            return False
+    return True
+
 # -------------------------
 # Loading (upsert with id map and ambiguity guard)
 # -------------------------
@@ -364,11 +400,46 @@ def upsert_contacts(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]])
                 results = hs.search_contacts(filters=[{"propertyName":"email","operator":"EQ","value":props["email"]}], properties=[PATIENT_NATURAL_ID_PROP])
                 if len(results) == 1:
                     hubspot_id = results[0]["id"]
+                    upsert_id_map(bq, "contacts", natural_key, hubspot_id)
                 elif len(results) > 1:
                     # ambiguous
                     write_dlq(bq, "patients", natural_key, "contacts", props, "ambiguous_multiple_matches", 1)
                     log("contact_ambiguous_multiple", email_hash=hash8(props["email"]), count=len(results))
                     continue
+            # If still unmatched, try normalized name + DOB search with address reconciliation
+            if not hubspot_id:
+                first = props.get("firstname")
+                last = props.get("lastname")
+                dob = props.get("date_of_birth")
+                norm_first = normalize_text(first)
+                norm_last = normalize_text(last)
+                norm_dob = normalize_dob(dob)
+                if norm_first and norm_last and norm_dob:
+                    results = hs.search_contacts(
+                        filters=[
+                            {"propertyName": "firstname", "operator": "EQ", "value": norm_first},
+                            {"propertyName": "lastname", "operator": "EQ", "value": norm_last},
+                            {"propertyName": "date_of_birth", "operator": "EQ", "value": norm_dob},
+                        ],
+                        properties=[PATIENT_NATURAL_ID_PROP, "address", "city", "state", "zip", "firstname", "lastname", "date_of_birth"],
+                    )
+                    if results:
+                        address_matches = [r for r in results if addresses_match(props, r.get("properties", {}))]
+                        if len(address_matches) == 1:
+                            hubspot_id = address_matches[0]["id"]
+                            upsert_id_map(bq, "contacts", natural_key, hubspot_id)
+                        elif len(address_matches) > 1:
+                            write_dlq(bq, "patients", natural_key, "contacts", props, "ambiguous_address_matches", 1)
+                            log("contact_ambiguous_address", natural_key=natural_key, matches=len(address_matches))
+                            continue
+                        else:
+                            log(
+                                "contact_address_mismatch",
+                                natural_key=natural_key,
+                                name_hash=hash8(f"{norm_first}|{norm_last}"),
+                                dob_hash=hash8(norm_dob),
+                                candidates=len(results),
+                            )
             # upsert
             obj_id, created_flag = hs.create_or_update_contact(props, hubspot_id)
             if obj_id:
