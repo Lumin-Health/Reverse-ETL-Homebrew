@@ -180,8 +180,6 @@ def create_hubspot_contact(api_key, patient_data):
 
 def update_hubspot_contact(api_key, contact_id, patient_data):
     """Updates an existing Hubspot contact."""
-def update_hubspot_contact(api_key, contact_id, patient_data):
-    """Updates an existing Hubspot contact."""
     url = f"https://api.hubapi.com/crm/v3/objects/contacts/{contact_id}"
     headers = {
         "Authorization": f"Bearer {api_key}",

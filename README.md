@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/22407800/README.md)
 # Reverse ETL Homebrew: AdvancedMD to Hubspot Sync
 
 ## Project Overview
@@ -106,11 +105,3 @@ Before proceeding to Act mode, please ensure the following:
 *   **Hubspot API Key**: Ensure the Hubspot API key has the necessary scopes: `crm.objects.contacts.read`, `crm.objects.contacts.write`, `crm.objects.custom_objects.read`, `crm.objects.custom_objects.write`.
 *   **GCP Permissions**: Provide necessary permissions for enabling Google Cloud APIs (Cloud Functions, Cloud Scheduler, Secret Manager, BigQuery) and creating/configuring service accounts with appropriate IAM roles in the `lumininternal` project.
 *   **Hubspot Custom Property**: Confirm that the custom property `property_amd_template_id` has been created in your Hubspot instance.
-</content>
-<task_progress>
-- [x] Gather initial requirements and context
-- [x] Propose architecture and detailed implementation plan
-- [ ] Implement BigQuery data extraction for Patients
-- [ ] Implement Hubspot Contact matching and upsert logic
-- [ ] Implement BigQuery data extraction for ROIs
--   **Hubspot Custom Property**: Confirm that the custom property `property_amd_template_id` has been created in your Hubspot instance.
