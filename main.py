@@ -449,7 +449,9 @@ def run_job(job_type: str):
 
 # Cloud Functions HTTP entrypoints
 def sync_patients(request=None):
-    return run_job("patients")
+    print("--- DEBUG: sync_patients function started successfully. ---")
+    return ("Debug test successful.", 200)
+    # return run_job("patients")
 
 def sync_rois(request=None):
     return run_job("rois")
