@@ -462,7 +462,16 @@ def run_job(job_type: str):
 
 # Cloud Functions HTTP entrypoints
 def sync_patients(request=None):
-    return run_job("patients")
+    print("--- DIAGNOSTIC: Function started. Attempting to import BigQuery library. ---")
+    try:
+        from google.cloud import bigquery
+        print("--- DIAGNOSTIC: BigQuery library imported successfully. ---")
+        client = bigquery.Client()
+        print("--- DIAGNOSTIC: BigQuery client initialized successfully. ---")
+        return ("Diagnostic test successful.", 200)
+    except Exception as e:
+        print(f"--- DIAGNOSTIC ERROR: Failed during diagnostic test. Error: {e} ---")
+        return (f"Diagnostic test failed: {e}", 500)
 
 def sync_rois(request=None):
     return run_job("rois")
