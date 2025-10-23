@@ -399,10 +399,23 @@ def upsert_rois(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]]) -> 
 # -------------------------
 
 def run_job(job_type: str):
+    log("run_job_start", job_type=job_type)
+    
+    log("initializing_bigquery_client")
     bq = bigquery.Client(project=GCP_PROJECT_ID)
+    log("initializing_bigquery_client_ok")
+
+    log("ensuring_control_tables")
     ensure_control_tables(bq)
+    log("ensuring_control_tables_ok")
+
+    log("fetching_hubspot_api_key")
     hs_key = fetch_hubspot_api_key(GCP_PROJECT_ID, HUBSPOT_API_SECRET_NAME)
+    log("fetching_hubspot_api_key_ok")
+
+    log("initializing_hubspot_client")
     hs = HubSpot(hs_key)
+    log("initializing_hubspot_client_ok")
 
     started = now_utc()
     watermark = read_high_watermark(bq, job_type)
@@ -449,9 +462,7 @@ def run_job(job_type: str):
 
 # Cloud Functions HTTP entrypoints
 def sync_patients(request=None):
-    print("--- DEBUG: sync_patients function started successfully. ---")
-    return ("Debug test successful.", 200)
-    # return run_job("patients")
+    return run_job("patients")
 
 def sync_rois(request=None):
     return run_job("rois")
