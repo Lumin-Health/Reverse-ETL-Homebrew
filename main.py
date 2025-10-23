@@ -90,10 +90,13 @@ def chunks(iterable: List[Dict], size: int) -> Iterable[List[Dict]]:
 # -------------------------
 
 def fetch_hubspot_api_key(project_id: str, secret_name: str) -> str:
+    log("secret_fetch_start", project_id=project_id, secret_name=secret_name)
     client = secretmanager.SecretManagerServiceClient()
     name = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
     response = client.access_secret_version(request={"name": name})
-    return response.payload.data.decode("UTF-8")
+    secret = response.payload.data.decode("UTF-8")
+    log("secret_fetch_ok", secret_name=secret_name)
+    return secret
 
 # -------------------------
 # BigQuery helpers
@@ -101,7 +104,9 @@ def fetch_hubspot_api_key(project_id: str, secret_name: str) -> str:
 
 def ensure_control_tables(bq: bigquery.Client):
     """Create control tables if they don't exist (idempotent)."""
+    log("ensure_control_tables_start", run_ledger=RUN_LEDGER_TABLE, dlq=DLQ_TABLE, id_map=ID_MAP_TABLE)
     # Run ledger
+    log("ensure_control_table_create", table=RUN_LEDGER_TABLE)
     bq.query(f"""
         CREATE TABLE IF NOT EXISTS `{RUN_LEDGER_TABLE}` (
             run_id STRING,
@@ -117,8 +122,10 @@ def ensure_control_tables(bq: bigquery.Client):
             status STRING            -- 'success' | 'failed' | 'partial'
         )
     """).result()
+    log("ensure_control_table_ready", table=RUN_LEDGER_TABLE)
 
     # DLQ
+    log("ensure_control_table_create", table=DLQ_TABLE)
     bq.query(f"""
         CREATE TABLE IF NOT EXISTS `{DLQ_TABLE}` (
             ts TIMESTAMP,
@@ -130,8 +137,10 @@ def ensure_control_tables(bq: bigquery.Client):
             attempt INT64
         )
     """).result()
+    log("ensure_control_table_ready", table=DLQ_TABLE)
 
     # ID map
+    log("ensure_control_table_create", table=ID_MAP_TABLE)
     bq.query(f"""
         CREATE TABLE IF NOT EXISTS `{ID_MAP_TABLE}` (
             hubspot_object_type STRING,  -- 'contacts' | custom object name
@@ -140,8 +149,11 @@ def ensure_control_tables(bq: bigquery.Client):
             updated_at TIMESTAMP
         )
     """).result()
+    log("ensure_control_table_ready", table=ID_MAP_TABLE)
+    log("ensure_control_tables_complete")
 
 def read_high_watermark(bq: bigquery.Client, job_type: str) -> Optional[datetime]:
+    log("high_watermark_read_start", job_type=job_type, run_ledger=RUN_LEDGER_TABLE)
     q = f"""
       SELECT high_watermark
       FROM `{RUN_LEDGER_TABLE}`
@@ -153,13 +165,18 @@ def read_high_watermark(bq: bigquery.Client, job_type: str) -> Optional[datetime
         query_parameters=[bigquery.ScalarQueryParameter("job_type","STRING",job_type)]
     ))
     rows = list(job.result())
-    return rows[0]["high_watermark"] if rows else None
+    watermark = rows[0]["high_watermark"] if rows else None
+    log("high_watermark_read_complete", job_type=job_type, watermark=str(watermark) if watermark else None)
+    return watermark
 
 def write_run_ledger(bq: bigquery.Client, row: Dict[str, Any]):
     table = RUN_LEDGER_TABLE
+    log("run_ledger_write_start", table=table, job_type=row.get("job_type"), status=row.get("status"))
     bq.insert_rows_json(table, [row])
+    log("run_ledger_write_complete", table=table, job_type=row.get("job_type"), status=row.get("status"))
 
 def upsert_id_map(bq: bigquery.Client, obj_type: str, natural_key: str, hubspot_id: str):
+    log("id_map_upsert_start", object_type=obj_type, natural_key=natural_key)
     q = f"""
       MERGE `{ID_MAP_TABLE}` T
       USING (SELECT @obj_type AS obj_type, @natural_key AS nk, @hubspot_id AS hid) S
@@ -175,8 +192,10 @@ def upsert_id_map(bq: bigquery.Client, obj_type: str, natural_key: str, hubspot_
             bigquery.ScalarQueryParameter("hubspot_id","STRING",hubspot_id),
         ]
     )).result()
+    log("id_map_upsert_complete", object_type=obj_type, natural_key=natural_key)
 
 def get_mapped_hubspot_id(bq: bigquery.Client, obj_type: str, natural_key: str) -> Optional[str]:
+    log("id_map_lookup_start", object_type=obj_type, natural_key=natural_key)
     q = f"""
       SELECT hubspot_id FROM `{ID_MAP_TABLE}`
       WHERE hubspot_object_type = @obj_type AND natural_key = @nk
@@ -189,9 +208,12 @@ def get_mapped_hubspot_id(bq: bigquery.Client, obj_type: str, natural_key: str) 
         ]
     ))
     rows = list(job.result())
-    return rows[0]["hubspot_id"] if rows else None
+    hubspot_id = rows[0]["hubspot_id"] if rows else None
+    log("id_map_lookup_complete", object_type=obj_type, natural_key=natural_key, found=bool(hubspot_id))
+    return hubspot_id
 
 def write_dlq(bq: bigquery.Client, job_type: str, natural_key: str, hubspot_object_type: str, payload: Dict[str,Any], error: str, attempt: int):
+    log("dlq_write_start", job_type=job_type, natural_key=natural_key, hubspot_object_type=hubspot_object_type, error=error)
     bq.insert_rows_json(DLQ_TABLE, [{
         "ts": datetime.utcnow().isoformat(),
         "job_type": job_type,
@@ -201,6 +223,7 @@ def write_dlq(bq: bigquery.Client, job_type: str, natural_key: str, hubspot_obje
         "error": error[:10000],
         "attempt": attempt
     }])
+    log("dlq_write_complete", job_type=job_type, natural_key=natural_key, hubspot_object_type=hubspot_object_type)
 
 # -------------------------
 # HubSpot API helpers
@@ -218,6 +241,7 @@ class HubSpot:
         url = f"{HUBSPOT_BASE}{path}"
         for attempt in range(1, MAX_RETRIES+1):
             try:
+                log("hubspot_request_start", method=method, path=path, attempt=attempt)
                 resp = self.session.request(method, url, timeout=HUBSPOT_TIMEOUT, **kwargs)
                 if resp.status_code in (429, 500, 502, 503, 504):
                     backoff = min(30, INITIAL_BACKOFF * (2 ** (attempt-1)))
@@ -229,11 +253,13 @@ class HubSpot:
                     data = resp.json()
                 except Exception:
                     pass
+                log("hubspot_request_complete", method=method, path=path, attempt=attempt, status=resp.status_code)
                 return resp.status_code, data
             except requests.RequestException as e:
                 backoff = min(30, INITIAL_BACKOFF * (2 ** (attempt-1)))
                 log("hubspot_exception_retry", error=str(e), attempt=attempt, backoff_seconds=backoff)
                 time.sleep(backoff)
+        log("hubspot_request_failed", method=method, path=path)
         return 599, {"error": "max retries exceeded"}
 
     # Contacts
@@ -292,6 +318,7 @@ class HubSpot:
 # -------------------------
 
 def fetch_rows(bq: bigquery.Client, table: str, updated_col: str, watermark: Optional[datetime]) -> List[Dict[str,Any]]:
+    log("fetch_rows_start", table=table, delta=bool(watermark), watermark=str(watermark) if watermark else None)
     if watermark:
         q = f"SELECT * FROM `{table}` WHERE {updated_col} >= @wm"
         params = [bigquery.ScalarQueryParameter("wm","TIMESTAMP", watermark)]
@@ -350,6 +377,7 @@ def map_roi_to_custom(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
 
 def upsert_contacts(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]]) -> Tuple[int,int,int]:
     created=updated=skipped=0
+    log("upsert_contacts_start", total=len(rows))
     for batch in chunks(rows, BATCH_SIZE):
         for row in batch:
             natural_key, props = map_patient_to_contact(row)
@@ -377,10 +405,12 @@ def upsert_contacts(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]])
                 else: updated += 1
             else:
                 write_dlq(bq, "patients", natural_key, "contacts", props, "create_or_update_failed", 1)
+    log("upsert_contacts_complete", total=len(rows), created=created, updated=updated, skipped=skipped)
     return created, updated, skipped
 
 def upsert_rois(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]]) -> Tuple[int,int,int]:
     created=updated=skipped=0
+    log("upsert_rois_start", total=len(rows))
     for batch in chunks(rows, BATCH_SIZE):
         for row in batch:
             natural_key, props = map_roi_to_custom(row)
@@ -392,6 +422,7 @@ def upsert_rois(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]]) -> 
                 else: updated += 1
             else:
                 write_dlq(bq, "rois", natural_key, ROI_OBJECT_TYPE, props, "create_or_update_failed", 1)
+    log("upsert_rois_complete", total=len(rows), created=created, updated=updated, skipped=skipped)
     return created, updated, skipped
 
 # -------------------------
@@ -462,16 +493,7 @@ def run_job(job_type: str):
 
 # Cloud Functions HTTP entrypoints
 def sync_patients(request=None):
-    print("--- DIAGNOSTIC: Function started. Attempting to import BigQuery library. ---")
-    try:
-        from google.cloud import bigquery
-        print("--- DIAGNOSTIC: BigQuery library imported successfully. ---")
-        client = bigquery.Client()
-        print("--- DIAGNOSTIC: BigQuery client initialized successfully. ---")
-        return ("Diagnostic test successful.", 200)
-    except Exception as e:
-        print(f"--- DIAGNOSTIC ERROR: Failed during diagnostic test. Error: {e} ---")
-        return (f"Diagnostic test failed: {e}", 500)
+    return run_job("patients")
 
 def sync_rois(request=None):
     return run_job("rois")
