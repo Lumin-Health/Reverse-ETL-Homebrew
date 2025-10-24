@@ -357,7 +357,6 @@ def map_patient_to_contact(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
         "email": (row.get("Email") or "").strip().lower() or None,
         "firstname": row.get("FirstName"),
         "lastname": row.get("LastName"),
-        PATIENT_NATURAL_ID_PROP: natural_key,
         "date_of_birth": str(row.get("DOB")) if row.get("DOB") else None,
         "address": row.get("Address1"),
         "city": row.get("City"),
@@ -373,6 +372,8 @@ def map_patient_to_contact(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
         "active_treatment": row.get("Active"),
         "lifecyclestage": "customer",
     }
+    if PATIENT_NATURAL_ID_PROP:
+        props[PATIENT_NATURAL_ID_PROP] = natural_key
     # Drop Nones/blank strings and coerce Decimal/Datetime to JSON-safe values
     props = {k: clean_value(v) for k,v in props.items() if v not in (None,"")}
     return natural_key, props
@@ -406,7 +407,11 @@ def upsert_contacts(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]])
                 continue
             # If unmapped, try search by email
             if not hubspot_id and "email" in props:
-                results = hs.search_contacts(filters=[{"propertyName":"email","operator":"EQ","value":props["email"]}], properties=[PATIENT_NATURAL_ID_PROP])
+                search_properties = [PATIENT_NATURAL_ID_PROP] if PATIENT_NATURAL_ID_PROP else None
+                results = hs.search_contacts(
+                    filters=[{"propertyName":"email","operator":"EQ","value":props["email"]}],
+                    properties=search_properties
+                )
                 if len(results) == 1:
                     hubspot_id = results[0]["id"]
                 elif len(results) > 1:
