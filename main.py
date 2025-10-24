@@ -403,20 +403,20 @@ def map_patient_to_contact(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
 def map_roi_to_custom(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
     natural_key = str(row.get("ROI_ID") or row.get("roi_id") or row.get("ID") or hash8(json.dumps(row)))
     props = {
-        "property_roi_type": row.get("TemplateName"),
-        "property_patient_chart": row.get("PatientChart"),
-        "property_raw_provider_name": row.get("ProviderName"),
-        "property_patient_signed_dob": to_epoch_millis(row.get("DOB")),
-        "property_patient_signed_name": row.get("Patient Name") or row.get("Patient_Name"),
-        "property_raw_provider_specialty": row.get("Specialty"),
-        "property_raw_provider_email": row.get("Email"),
-        "property_raw_provider_phone": row.get("Phone"),
-        "property_raw_provider_fax": row.get("Fax"),
-        "property_completed_date": to_epoch_millis(row.get("CompletedDate")),
-        "property_patient_id": row.get("PatientID"),
-        "property_accepted_datetime": to_epoch_millis(row.get("AcceptedDatetime")),
-        "property_amd_template_id": row.get("TemplateID"),
-        "property_roi_id": row.get("roi_id") or row.get("ROI_ID"),
+        "roi_type": row.get("TemplateName"),
+        "patient_chart": row.get("PatientChart"),
+        "raw_provider_name": row.get("ProviderName"),
+        "patient_signed_dob": to_epoch_millis(row.get("DOB")),
+        "patient_signed_name": row.get("Patient Name") or row.get("Patient_Name"),
+        "raw_provider_specialty": row.get("Specialty"),
+        "raw_provider_email": row.get("Email"),
+        "raw_provider_phone": row.get("Phone"),
+        "raw_provider_fax": row.get("Fax"),
+        "completed_date": to_epoch_millis(row.get("CompletedDate")),
+        "patient_id": row.get("PatientID"),
+        "accepted_datetime": to_epoch_millis(row.get("AcceptedDatetime")),
+        "amd_template_id": row.get("TemplateID"),
+        "roi_id": row.get("roi_id") or row.get("ROI_ID"),
     }
     props = {k: clean_value(v) for k,v in props.items() if v not in (None,"")}
     for protected in ROI_PROTECTED_PROPERTIES:
