@@ -355,6 +355,14 @@ def map_patient_to_contact(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
         "state": row.get("State"),
         "zip": row.get("PostalCode"),
         "phone": row.get("Phone"),
+        "patient_id": row.get("ID"),
+        "patient_chart": row.get("Chart"),
+        "primary_facility": row.get("PrimaryFacility"),
+        "spravatostodate": row.get("SpravatosToDate"),
+        "ketaminestodate": row.get("KetaminesToDate"),
+        "first_initial_consult__treatment_": row.get("FirstTreatment"),
+        "active_treatment": row.get("Active"),
+        "lifecyclestage": "customer",
     }
     # Drop Nones to avoid overwriting with nulls
     props = {k:v for k,v in props.items() if v not in (None,"")}
