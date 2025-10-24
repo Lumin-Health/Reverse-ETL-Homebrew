@@ -16,6 +16,7 @@ import requests
 from google.cloud import bigquery
 from google.cloud import secretmanager
 from dotenv import load_dotenv
+from decimal import Decimal
 
 # -------------------------
 # Environment & Constants
@@ -84,6 +85,13 @@ def hash8(value: str) -> str:
 def chunks(iterable: List[Dict], size: int) -> Iterable[List[Dict]]:
     for i in range(0, len(iterable), size):
         yield iterable[i:i+size]
+
+def clean_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
 
 # -------------------------
 # Secret Manager
@@ -172,7 +180,8 @@ def read_high_watermark(bq: bigquery.Client, job_type: str) -> Optional[datetime
 def write_run_ledger(bq: bigquery.Client, row: Dict[str, Any]):
     table = RUN_LEDGER_TABLE
     log("run_ledger_write_start", table=table, job_type=row.get("job_type"), status=row.get("status"))
-    bq.insert_rows_json(table, [row])
+    sanitized = {k: clean_value(v) for k,v in row.items()}
+    bq.insert_rows_json(table, [sanitized])
     log("run_ledger_write_complete", table=table, job_type=row.get("job_type"), status=row.get("status"))
 
 def upsert_id_map(bq: bigquery.Client, obj_type: str, natural_key: str, hubspot_id: str):
@@ -364,8 +373,8 @@ def map_patient_to_contact(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
         "active_treatment": row.get("Active"),
         "lifecyclestage": "customer",
     }
-    # Drop Nones to avoid overwriting with nulls
-    props = {k:v for k,v in props.items() if v not in (None,"")}
+    # Drop Nones/blank strings and coerce Decimal/Datetime to JSON-safe values
+    props = {k: clean_value(v) for k,v in props.items() if v not in (None,"")}
     return natural_key, props
 
 def map_roi_to_custom(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
@@ -376,7 +385,7 @@ def map_roi_to_custom(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
         "template_id": row.get("TemplateID") or row.get("template_id"),
         "patient_chart": row.get("Chart") or row.get("chart"),
     }
-    props = {k:v for k,v in props.items() if v not in (None,"")}
+    props = {k: clean_value(v) for k,v in props.items() if v not in (None,"")}
     return natural_key, props
 
 # -------------------------
