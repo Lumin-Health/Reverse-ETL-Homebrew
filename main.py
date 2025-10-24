@@ -93,6 +93,25 @@ def clean_value(value: Any) -> Any:
         return value.isoformat()
     return value
 
+def to_epoch_millis(value: Any) -> Optional[int]:
+    if value in (None, "",):
+        return None
+    dt: Optional[datetime] = None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        try:
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not dt:
+        return None
+    if not dt.tzinfo:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
 # -------------------------
 # Secret Manager
 # -------------------------
@@ -368,7 +387,7 @@ def map_patient_to_contact(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
         "primary_facility": row.get("PrimaryFacility"),
         "spravatostodate": row.get("SpravatosToDate"),
         "ketaminestodate": row.get("KetaminesToDate"),
-        "first_initial_consult__treatment_": row.get("FirstTreatment"),
+        "first_initial_consult__treatment_": to_epoch_millis(row.get("FirstTreatment")),
         "active_treatment": row.get("Active"),
         "lifecyclestage": "customer",
     }
