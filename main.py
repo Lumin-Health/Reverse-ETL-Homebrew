@@ -55,6 +55,9 @@ ROI_OBJECT_TYPE = os.getenv("ROI_OBJECT_TYPE", "p_roi")  # example: "p_roi"
 # Custom property names
 PATIENT_NATURAL_ID_PROP = os.getenv("PATIENT_NATURAL_ID_PROP", "amd_patient_id")
 ROI_NATURAL_ID_PROP     = os.getenv("ROI_NATURAL_ID_PROP", "roi_id")
+ROI_PROTECTED_PROPERTIES = {
+    p.strip() for p in os.getenv("ROI_PROTECTED_PROPERTIES", "").split(",") if p.strip()
+}
 
 # -------------------------
 # Utilities
@@ -400,12 +403,26 @@ def map_patient_to_contact(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
 def map_roi_to_custom(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
     natural_key = str(row.get("ROI_ID") or row.get("roi_id") or row.get("ID") or hash8(json.dumps(row)))
     props = {
-        ROI_NATURAL_ID_PROP: natural_key,
-        "status": row.get("Status"),
-        "template_id": row.get("TemplateID") or row.get("template_id"),
-        "patient_chart": row.get("Chart") or row.get("chart"),
+        "property_roi_type": row.get("TemplateName"),
+        "property_patient_chart": row.get("PatientChart"),
+        "property_raw_provider_name": row.get("ProviderName"),
+        "property_patient_signed_dob": to_epoch_millis(row.get("DOB")),
+        "property_patient_signed_name": row.get("Patient Name") or row.get("Patient_Name"),
+        "property_raw_provider_specialty": row.get("Specialty"),
+        "property_raw_provider_email": row.get("Email"),
+        "property_raw_provider_phone": row.get("Phone"),
+        "property_raw_provider_fax": row.get("Fax"),
+        "property_completed_date": to_epoch_millis(row.get("CompletedDate")),
+        "property_patient_id": row.get("PatientID"),
+        "property_accepted_datetime": to_epoch_millis(row.get("AcceptedDatetime")),
+        "property_amd_template_id": row.get("TemplateID"),
+        "property_roi_id": row.get("roi_id") or row.get("ROI_ID"),
     }
     props = {k: clean_value(v) for k,v in props.items() if v not in (None,"")}
+    for protected in ROI_PROTECTED_PROPERTIES:
+        props.pop(protected, None)
+    if ROI_NATURAL_ID_PROP:
+        props[ROI_NATURAL_ID_PROP] = natural_key
     return natural_key, props
 
 # -------------------------
