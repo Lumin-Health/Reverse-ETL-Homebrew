@@ -471,6 +471,13 @@ def upsert_rois(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]]) -> 
     log("upsert_rois_start", total=len(rows))
     for batch in chunks(rows, BATCH_SIZE):
         for row in batch:
+            status = row.get("processing_status") or row.get("ProcessingStatus")
+            processed_at = row.get("processing_datetime") or row.get("ProcessingDatetime") or row.get("ProcessingDateTime")
+            if status and status.lower() == "processed" and processed_at not in (None, ""):
+                natural_key = str(row.get("ROI_ID") or row.get("roi_id") or row.get("ID") or hash8(json.dumps(row)))
+                skipped += 1
+                log("roi_manual_processed_skip", natural_key=natural_key, status=status, processed_at=str(processed_at))
+                continue
             natural_key, props = map_roi_to_custom(row)
             hubspot_id = get_mapped_hubspot_id(bq, ROI_OBJECT_TYPE, natural_key)
             obj_id, created_flag = hs.create_or_update_custom(ROI_OBJECT_TYPE, props, hubspot_id)
