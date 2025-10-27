@@ -60,21 +60,22 @@ The solution will be built on Google Cloud Platform (GCP) using Python for the i
 *   **Destination**: Hubspot Custom "ROI" object
 *   **Unique Identifier**: `AMD ROIs.roi_id` -> `Hubspot ROIs.property_roi_id`
 *   **Field Mappings**:
-    *   `AMD ROIs.roi_id` -> `property_roi_id`
-    *   `AMD ROIs.TemplateID` -> `property_amd_template_id` (new custom property, must be created in Hubspot)
-    *   `AMD ROIs.TemplateName` -> `property_roi_type`
-    *   `PatientID` -> `property_patient_id`
-    *   `PatientChart` -> `property_patient_chart`
-    *   `AcceptedDatetime` -> `property_accepted_datetime`
-    *   `CompletedDate` -> `property_completed_date`
-    *   `Patient Name` -> `property_patient_signed_name`
-    *   `DOB` -> `property_patient_signed_dob`
-    *   `ProviderName` -> `property_raw_provider_name`
-    *   `Specialty` -> `property_raw_provider_specialty`
-    *   `Email` -> `property_raw_provider_email`
-    *   `Phone` -> `property_raw_provider_phone`
-    *   `Fax` -> `property_raw_provider_fax`
-*   **Associations**: Associations between ROI objects and Contacts will be handled by Hubspot workflows, not by this integration.
+    *   `AMD ROIs.roi_id` -> `roi_id` (HubSpot natural identifier)
+    *   `AMD ROIs.TemplateID` -> `amd_template_id`
+    *   `AMD ROIs.TemplateName` -> `roi_type` (required by HubSpot)
+    *   `PatientID` -> `patient_id`
+    *   `PatientChart` -> `patient_chart`
+    *   `AcceptedDatetime` -> `accepted_datetime` (converted to epoch millis)
+    *   `CompletedDate` -> `completed_date` (converted to epoch millis)
+    *   `Patient Name` -> `patient_signed_name`
+    *   `DOB` -> `patient_signed_dob` (converted to epoch millis)
+    *   `ProviderName` -> `raw_provider_name`
+    *   `Specialty` -> `raw_provider_specialty`
+    *   `Email` -> `raw_provider_email`
+    *   `Phone` -> `raw_provider_phone`
+    *   `Fax` -> `raw_provider_fax`
+*   **Manual edits**: ROIs flagged as `processing_status = "Processed"` with a non-null `processing_datetime` are skipped so HubSpot-only updates stay intact. You can also list additional manual fields in the `ROI_PROTECTED_PROPERTIES` environment variable to exclude them from all writes.
+*   **Associations**: Associations between ROI objects and Contacts continue to be managed by Hubspot workflows, not this integration.
 
 ## Security & Compliance (HIPAA)
 
@@ -134,9 +135,10 @@ HUBSPOT_BASE=https://api.hubapi.com
 BATCH_SIZE=50
 MAX_RETRIES=5
 INITIAL_BACKOFF=0.5
-ROI_OBJECT_TYPE=p_roi
+ROI_OBJECT_TYPE=p_roi        # Override with your custom object ID, e.g. 2-51944773
 PATIENT_NATURAL_ID_PROP=amd_patient_id
 ROI_NATURAL_ID_PROP=roi_id
+ROI_PROTECTED_PROPERTIES=
 ```
 
 ### BigQuery
@@ -145,7 +147,7 @@ Create (or let the job auto-create) the control tables in dataset `${BQ_DATASET}
 - `hubspot_id_map` – natural key → hubspot id
 - `reverse_etl_dlq` – failures & ambiguities
 
-> If your source tables **do not** have an `updated_at` column, the job will do a full scan. Add the column and populate it to enable delta syncs.
+> If your source tables **do not** have an `updated_at` column, the job will do a full scan. Add the column and populate it to enable delta syncs. The ROI sync accepts an empty `ROI_UPDATED_AT_COL`, which forces a full-table load while you evaluate deltas.
 
 ### Cloud Functions
 Deploy two HTTP functions:
