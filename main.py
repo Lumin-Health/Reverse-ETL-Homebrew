@@ -10,7 +10,9 @@ import time
 import math
 import hashlib
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
+from zoneinfo import ZoneInfo
+import urllib.request
 
 import requests
 from google.cloud import bigquery
@@ -55,9 +57,18 @@ ROI_OBJECT_TYPE = os.getenv("ROI_OBJECT_TYPE", "p_roi")  # example: "p_roi"
 # Custom property names
 PATIENT_NATURAL_ID_PROP = os.getenv("PATIENT_NATURAL_ID_PROP", "amd_patient_id")
 ROI_NATURAL_ID_PROP     = os.getenv("ROI_NATURAL_ID_PROP", "roi_id")
+AMD_SYNC_LOCK_PROP      = os.getenv("AMD_SYNC_LOCK_PROP", "amd_synced")
 ROI_PROTECTED_PROPERTIES = {
     p.strip() for p in os.getenv("ROI_PROTECTED_PROPERTIES", "").split(",") if p.strip()
 }
+ROI_SLACK_WEBHOOK_SECRET_NAME = os.getenv("SLACK_ROI_WEBHOOK_SECRET", "")
+PATIENT_SLACK_WEBHOOK_SECRET_NAME = os.getenv("SLACK_PATIENT_WEBHOOK_SECRET", "")
+ROI_OVERRIDE_PROPERTY = os.getenv("ROI_OVERRIDE_PROPERTY", "roi_manual_override")
+ROI_PATIENT_MATCH_ERROR = "patient_match_missing"
+DEFAULT_SLACK_WEBHOOK_SECRET_NAME = PATIENT_SLACK_WEBHOOK_SECRET_NAME or ROI_SLACK_WEBHOOK_SECRET_NAME
+
+EASTERN_TZ = ZoneInfo("America/New_York")
+_SLACK_WEBHOOK_URL_CACHE: Dict[str, Optional[str]] = {}
 
 # -------------------------
 # Utilities
@@ -93,7 +104,9 @@ def clean_value(value: Any) -> Any:
     if isinstance(value, Decimal):
         return float(value)
     if isinstance(value, datetime):
-        return value.isoformat()
+        if value.tzinfo:
+            return value.astimezone(EASTERN_TZ).isoformat()
+        return value.replace(tzinfo=timezone.utc).astimezone(EASTERN_TZ).isoformat()
     return value
 
 def to_epoch_millis(value: Any) -> Optional[int]:
@@ -108,12 +121,77 @@ def to_epoch_millis(value: Any) -> Optional[int]:
                 value = value[:-1] + "+00:00"
             dt = datetime.fromisoformat(value)
         except ValueError:
+            try:
+                dt = datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                return None
+        except ValueError:
             return None
     if not dt:
         return None
     if not dt.tzinfo:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=EASTERN_TZ)
+    else:
+        dt = dt.astimezone(EASTERN_TZ)
     return int(dt.timestamp() * 1000)
+
+def to_eastern_date_string(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (datetime,)):
+        dt = value.astimezone(EASTERN_TZ) if value.tzinfo else value.replace(tzinfo=EASTERN_TZ)
+        return dt.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo:
+            parsed = parsed.astimezone(EASTERN_TZ)
+        else:
+            parsed = parsed.replace(tzinfo=EASTERN_TZ)
+        return parsed.date().isoformat()
+    except ValueError:
+        try:
+            parsed_date = datetime.strptime(str(value), "%Y-%m-%d").date()
+            return parsed_date.isoformat()
+        except ValueError:
+            return None
+
+def compute_next_birthday(dob_value: Any) -> Optional[str]:
+    if dob_value in (None, ""):
+        return None
+    dob_date: Optional[date] = None
+    if isinstance(dob_value, date) and not isinstance(dob_value, datetime):
+        dob_date = dob_value
+    else:
+        dob_str = str(dob_value)
+        try:
+            dob_date = datetime.fromisoformat(dob_str).date()
+        except ValueError:
+            try:
+                dob_date = datetime.strptime(dob_str, "%Y-%m-%d").date()
+            except Exception:
+                return None
+    if not dob_date:
+        return None
+    today = datetime.now(EASTERN_TZ).date()
+    next_bday = dob_date.replace(year=today.year)
+    if next_bday < today:
+        next_bday = next_bday.replace(year=today.year + 1)
+    return next_bday.isoformat()
+
+def format_identifier(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, Decimal):
+        if value == value.to_integral_value():
+            return str(int(value))
+        return format(value.normalize(), 'f').rstrip('0').rstrip('.')
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return str(value)
+    return str(value)
 
 # -------------------------
 # Secret Manager
@@ -127,6 +205,46 @@ def fetch_hubspot_api_key(project_id: str, secret_name: str) -> str:
     secret = response.payload.data.decode("UTF-8")
     log("secret_fetch_ok", secret_name=secret_name)
     return secret
+
+def fetch_secret(project_id: str, secret_name: str) -> Optional[str]:
+    if not secret_name:
+        return None
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+    response = client.access_secret_version(request={"name": name})
+    return response.payload.data.decode("UTF-8")
+
+def get_slack_webhook_url(secret_name: Optional[str]) -> Optional[str]:
+    if not secret_name:
+        return None
+    if secret_name in _SLACK_WEBHOOK_URL_CACHE:
+        return _SLACK_WEBHOOK_URL_CACHE[secret_name]
+    try:
+        url = fetch_secret(GCP_PROJECT_ID, secret_name)
+        _SLACK_WEBHOOK_URL_CACHE[secret_name] = url
+        return url
+    except Exception as exc:
+        log("slack_secret_fetch_error", error=str(exc), secret=secret_name)
+        _SLACK_WEBHOOK_URL_CACHE[secret_name] = None
+        return None
+
+def send_slack_alert(message: str, secret_name: Optional[str]):
+    webhook_url = get_slack_webhook_url(secret_name)
+    if not webhook_url:
+        log("slack_alert_skipped", reason="no_webhook_configured", secret=secret_name, message=message)
+        return
+    payload = {"text": message}
+    try:
+        req = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+        log("slack_alert_sent")
+    except Exception as exc:
+        log("slack_alert_failed", error=str(exc))
 
 # -------------------------
 # BigQuery helpers
@@ -256,6 +374,24 @@ def write_dlq(bq: bigquery.Client, job_type: str, natural_key: str, hubspot_obje
     }])
     log("dlq_write_complete", job_type=job_type, natural_key=natural_key, hubspot_object_type=hubspot_object_type)
 
+def read_failure_attempts(bq: bigquery.Client, job_type: str, natural_key: str, error: str) -> int:
+    q = f"""
+      SELECT IFNULL(MAX(attempt), 0) AS max_attempt
+      FROM `{DLQ_TABLE}`
+      WHERE job_type = @job_type
+        AND natural_key = @natural_key
+        AND error = @error
+    """
+    job = bq.query(q, job_config=bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("job_type","STRING",job_type),
+            bigquery.ScalarQueryParameter("natural_key","STRING",natural_key),
+            bigquery.ScalarQueryParameter("error","STRING",error),
+        ]
+    ))
+    rows = list(job.result())
+    return int(rows[0]["max_attempt"]) if rows else 0
+
 # -------------------------
 # HubSpot API helpers
 # -------------------------
@@ -304,6 +440,16 @@ class HubSpot:
             return []
         return data.get("results", [])
 
+    def get_contact(self, hubspot_id: str, properties: Optional[List[str]]=None) -> Optional[Dict[str,Any]]:
+        params = {}
+        if properties:
+            params["properties"] = ",".join(properties)
+        status, data = self._request("GET", f"/crm/v3/objects/contacts/{hubspot_id}", params=params)
+        if status != 200:
+            log("hubspot_get_contact_error", status=status, hubspot_id=hubspot_id, data=data)
+            return None
+        return data
+
     def create_or_update_contact(self, properties: Dict[str,Any], hubspot_id: Optional[str]=None) -> Tuple[Optional[str], bool]:
         """Returns (hubspot_id, created_bool)."""
         if hubspot_id:
@@ -344,6 +490,16 @@ class HubSpot:
             log("hubspot_create_custom_error", status=status, object_type=object_type, data=data)
             return None, False
 
+    def get_custom(self, object_type: str, hubspot_id: str, properties: Optional[List[str]]=None) -> Optional[Dict[str,Any]]:
+        params = {}
+        if properties:
+            params["properties"] = ",".join(properties)
+        status, data = self._request("GET", f"/crm/v3/objects/{object_type}/{hubspot_id}", params=params)
+        if status != 200:
+            log("hubspot_get_custom_error", status=status, object_type=object_type, hubspot_id=hubspot_id, data=data)
+            return None
+        return data
+
 # -------------------------
 # Extraction
 # -------------------------
@@ -374,37 +530,87 @@ def map_patient_to_contact(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
     Returns (natural_key, properties). Natural key is amd_patient_id (falls back to Chart or ID if present).
     Adjust field names to your schema.
     """
-    natural_key = str(row.get("ID") or row.get("Chart") or row.get("PatientID") or row.get("Email") or hash8(json.dumps(row)))
+    patient_id_raw = row.get("ID")
+    patient_chart_raw = row.get("Chart")
+    patient_id = format_identifier(patient_id_raw)
+    patient_chart = format_identifier(patient_chart_raw)
+    fallback_key = row.get("PatientID") or row.get("Email") or hash8(json.dumps(row))
+    natural_key = patient_id or patient_chart or str(fallback_key)
+    dob_value = row.get("DOB")
+    next_treatment = row.get("NextTreatment")
+    next_follow_up = row.get("NextFollowUp")
+    first_treatment = row.get("FirstTreatment") or row.get("FirstInitialConsult")
     props = {
         "email": (row.get("Email") or "").strip().lower() or None,
         "firstname": row.get("FirstName"),
-        "lastname": row.get("LastName"),
-        "date_of_birth": str(row.get("DOB")) if row.get("DOB") else None,
+        "preferred_first_name": row.get("PreferredFirstName"),
+        "middlename": row.get("MiddleName") or row.get("PreferredMiddleName"),
+        "lastname": row.get("LastName") or row.get("PreferredLastName"),
+        "gender": row.get("Gender"),
+        "date_of_birth": str(dob_value) if dob_value else None,
+        "next_birthday": compute_next_birthday(dob_value),
         "address": row.get("Address1"),
+        "street_address_line_2": row.get("Address2"),
         "city": row.get("City"),
         "state": row.get("State"),
-        "zip": row.get("PostalCode"),
-        "phone": row.get("Phone"),
-        "patient_id": row.get("ID"),
-        "patient_chart": row.get("Chart"),
+        "zip": row.get("Zipcode"),
+        "phone": row.get("HomePhone") or row.get("Phone"),
+        "otherphone": row.get("OtherPhone"),
+        "patient_id": patient_id,
+        "patient_chart": patient_chart,
         "primary_facility": row.get("PrimaryFacility"),
+        "primary_facility_code": row.get("PrimaryFacilityCode"),
         "spravatostodate": row.get("SpravatosToDate"),
         "ketaminestodate": row.get("KetaminesToDate"),
-        "first_initial_consult__treatment_": to_epoch_millis(row.get("FirstTreatment")),
+        "treatmentstodate": row.get("TreatmentsToDate"),
+        "future_treatment_count": row.get("FutureTreatmentCount"),
+        "future_follow_up_count": row.get("FutureFollowUpCount"),
+        "next_treatment_date": to_eastern_date_string(next_treatment or row.get("MaxScheduledTreatment")),
+        "next_follow_up_date": to_eastern_date_string(next_follow_up),
+        "first_initial_consult__treatment_": to_epoch_millis(first_treatment),
+        "started": row.get("Started"),
         "active_treatment": row.get("Active"),
+        "care_type": row.get("CareType"),
         "lifecyclestage": "customer",
     }
+    # add AMD lock flag default false; will be set to true once synced
+    props[AMD_SYNC_LOCK_PROP] = True
     if PATIENT_NATURAL_ID_PROP:
         props[PATIENT_NATURAL_ID_PROP] = natural_key
     # Drop Nones/blank strings and coerce Decimal/Datetime to JSON-safe values
     props = {k: clean_value(v) for k,v in props.items() if v not in (None,"")}
     return natural_key, props
 
+def find_patient_contact(bq: bigquery.Client, hs: HubSpot, patient_id: Any, patient_chart: Any) -> Optional[str]:
+    formatted_patient_id = format_identifier(patient_id)
+    formatted_patient_chart = format_identifier(patient_chart)
+    candidates = []
+    if formatted_patient_id:
+        candidates.append(formatted_patient_id)
+    if formatted_patient_chart:
+        candidates.append(formatted_patient_chart)
+    for candidate in candidates:
+        hubspot_id = get_mapped_hubspot_id(bq, "contacts", candidate)
+        if hubspot_id:
+            return hubspot_id
+    # Fallback to HubSpot search
+    for candidate, property_name in ((formatted_patient_id, "patient_id"), (formatted_patient_chart, "patient_chart")):
+        if not candidate:
+            continue
+        filters = [{"propertyName": property_name, "operator": "EQ", "value": candidate}]
+        results = hs.search_contacts(filters=filters, properties=[AMD_SYNC_LOCK_PROP])
+        if results:
+            return results[0]["id"]
+    return None
+
 def map_roi_to_custom(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
-    natural_key = str(row.get("ROI_ID") or row.get("roi_id") or row.get("ID") or hash8(json.dumps(row)))
+    roi_id = format_identifier(row.get("ROI_ID") or row.get("roi_id"))
+    natural_key = roi_id or str(row.get("ID") or hash8(json.dumps(row)))
+    patient_id = format_identifier(row.get("PatientID"))
+    patient_chart = format_identifier(row.get("PatientChart"))
     props = {
         "roi_type": row.get("TemplateName"),
-        "patient_chart": row.get("PatientChart"),
+        "patient_chart": patient_chart,
         "raw_provider_name": row.get("ProviderName"),
         "patient_signed_dob": to_epoch_millis(row.get("DOB")),
         "patient_signed_name": row.get("Patient Name") or row.get("Patient_Name"),
@@ -413,10 +619,10 @@ def map_roi_to_custom(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
         "raw_provider_phone": row.get("Phone"),
         "raw_provider_fax": row.get("Fax"),
         "completed_date": to_epoch_millis(row.get("CompletedDate")),
-        "patient_id": row.get("PatientID"),
+        "patient_id": patient_id,
         "accepted_datetime": to_epoch_millis(row.get("AcceptedDatetime")),
         "amd_template_id": row.get("TemplateID"),
-        "roi_id": row.get("roi_id") or row.get("ROI_ID"),
+        "roi_id": roi_id,
     }
     props = {k: clean_value(v) for k,v in props.items() if v not in (None,"")}
     for protected in ROI_PROTECTED_PROPERTIES:
@@ -436,6 +642,20 @@ def upsert_contacts(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]])
         for row in batch:
             natural_key, props = map_patient_to_contact(row)
             hubspot_id = get_mapped_hubspot_id(bq, "contacts", natural_key)
+            locked = False
+            if hubspot_id:
+                contact = hs.get_contact(hubspot_id, properties=[AMD_SYNC_LOCK_PROP, "patient_id", "patient_chart"])
+                if contact:
+                    contact_props = contact.get("properties", {})
+                    locked = str(contact_props.get(AMD_SYNC_LOCK_PROP, "")).lower() == "true"
+                    if locked:
+                        props.pop("patient_id", None)
+                        props.pop("patient_chart", None)
+                        props.pop(AMD_SYNC_LOCK_PROP, None)
+                    else:
+                        props[AMD_SYNC_LOCK_PROP] = True
+                else:
+                    props[AMD_SYNC_LOCK_PROP] = True
             # ambiguity guard: if not mapped and no email, skip to DLQ
             if not hubspot_id and "email" not in props:
                 write_dlq(bq, "patients", natural_key, "contacts", props, "ambiguous_no_email_unmapped", 1)
@@ -462,7 +682,20 @@ def upsert_contacts(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]])
                 if created_flag: created += 1
                 else: updated += 1
             else:
-                write_dlq(bq, "patients", natural_key, "contacts", props, "create_or_update_failed", 1)
+                attempts = read_failure_attempts(bq, "patients", natural_key, "create_or_update_failed") + 1
+                write_dlq(bq, "patients", natural_key, "contacts", props, "create_or_update_failed", attempts)
+                if attempts >= 5:
+                    timestamp = datetime.now(EASTERN_TZ).isoformat()
+                    patient_id_fmt = format_identifier(row.get('ID'))
+                    patient_chart_fmt = format_identifier(row.get('Chart'))
+                    send_slack_alert(
+                        ":warning: Patient sync failed after 5 retries\n"
+                        f"*Natural key:* {natural_key}\n"
+                        f"*Patient ID / Chart:* {patient_id_fmt} / {patient_chart_fmt}\n"
+                        f"*Email:* {row.get('Email') or 'unknown'}\n"
+                        f"*Timestamp:* {timestamp}",
+                        DEFAULT_SLACK_WEBHOOK_SECRET_NAME,
+                    )
     log("upsert_contacts_complete", total=len(rows), created=created, updated=updated, skipped=skipped)
     return created, updated, skipped
 
@@ -478,8 +711,49 @@ def upsert_rois(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]]) -> 
                 skipped += 1
                 log("roi_manual_processed_skip", natural_key=natural_key, status=status, processed_at=str(processed_at))
                 continue
+            patient_id = row.get("PatientID")
+            patient_chart = row.get("PatientChart")
+            patient_contact_id = find_patient_contact(bq, hs, patient_id, patient_chart)
+            if not patient_contact_id:
+                natural_key = str(row.get("ROI_ID") or row.get("roi_id") or row.get("ID") or hash8(json.dumps(row)))
+                attempts = read_failure_attempts(bq, "rois", natural_key, ROI_PATIENT_MATCH_ERROR) + 1
+                skipped += 1
+                log("roi_patient_missing", natural_key=natural_key, patient_id=patient_id, patient_chart=patient_chart, attempt=attempts)
+                write_dlq(
+                    bq,
+                    "rois",
+                    natural_key,
+                    ROI_OBJECT_TYPE,
+                    {
+                        "patient_id": patient_id,
+                        "patient_chart": patient_chart,
+                        "processing_status": status,
+                    },
+                    ROI_PATIENT_MATCH_ERROR,
+                    attempts
+                )
+                if attempts >= 5:
+                    timestamp = datetime.now(EASTERN_TZ).isoformat()
+                    send_slack_alert(
+                        ":warning: ROI sync skipped after 5 retries\n"
+                        f"*ROI ID:* {natural_key}\n"
+                        f"*Patient ID / Chart:* {patient_id} / {patient_chart}\n"
+                        f"*Last status:* {status or 'unknown'}\n"
+                        f"*Timestamp:* {timestamp}",
+                        DEFAULT_SLACK_WEBHOOK_SECRET_NAME,
+                    )
+                continue
             natural_key, props = map_roi_to_custom(row)
             hubspot_id = get_mapped_hubspot_id(bq, ROI_OBJECT_TYPE, natural_key)
+            if hubspot_id:
+                existing = hs.get_custom(ROI_OBJECT_TYPE, hubspot_id, properties=[ROI_OVERRIDE_PROPERTY])
+                if existing:
+                    properties = existing.get("properties", {})
+                    override_flag = str(properties.get(ROI_OVERRIDE_PROPERTY, "")).lower() == "true"
+                    if override_flag:
+                        skipped += 1
+                        log("roi_manual_override_skip", natural_key=natural_key, hubspot_id=hubspot_id)
+                        continue
             obj_id, created_flag = hs.create_or_update_custom(ROI_OBJECT_TYPE, props, hubspot_id)
             if obj_id:
                 upsert_id_map(bq, ROI_OBJECT_TYPE, natural_key, obj_id)

@@ -74,7 +74,8 @@ The solution will be built on Google Cloud Platform (GCP) using Python for the i
     *   `Email` -> `raw_provider_email`
     *   `Phone` -> `raw_provider_phone`
     *   `Fax` -> `raw_provider_fax`
-*   **Manual edits**: ROIs flagged as `processing_status = "Processed"` with a non-null `processing_datetime` are skipped so HubSpot-only updates stay intact. You can also list additional manual fields in the `ROI_PROTECTED_PROPERTIES` environment variable to exclude them from all writes.
+*   **Manual edits**: ROIs flagged as `processing_status = "Processed"` with a non-null `processing_datetime` are skipped so HubSpot-only updates stay intact. You can also list additional manual fields in the `ROI_PROTECTED_PROPERTIES` environment variable to exclude them from all writes, and a `roi_manual_override` checkbox will bypass future updates.
+*   **Alerts**: If an ROI cannot find its patient after five nightly retries, the function posts an alert to the Slack channel wired through `SLACK_WEBHOOK_SECRET`.
 *   **Associations**: Associations between ROI objects and Contacts continue to be managed by Hubspot workflows, not this integration.
 
 ## Security & Compliance (HIPAA)
@@ -139,6 +140,9 @@ ROI_OBJECT_TYPE=p_roi        # Override with your custom object ID, e.g. 2-51944
 PATIENT_NATURAL_ID_PROP=amd_patient_id
 ROI_NATURAL_ID_PROP=roi_id
 ROI_PROTECTED_PROPERTIES=
+AMD_SYNC_LOCK_PROP=amd_synced
+SLACK_WEBHOOK_SECRET=SlackWebhookROIAlerts
+ROI_OVERRIDE_PROPERTY=roi_manual_override
 ```
 
 ### BigQuery
@@ -148,6 +152,17 @@ Create (or let the job auto-create) the control tables in dataset `${BQ_DATASET}
 - `reverse_etl_dlq` – failures & ambiguities
 
 > If your source tables **do not** have an `updated_at` column, the job will do a full scan. Add the column and populate it to enable delta syncs. The ROI sync accepts an empty `ROI_UPDATED_AT_COL`, which forces a full-table load while you evaluate deltas.
+
+### Field locking
+Contacts that successfully match to AdvancedMD have `amd_synced = true`; after that first sync the integration stops overwriting `patient_id` and `patient_chart`, ensuring AMD remains the source of truth while HubSpot users retain view-only access.
+
+### Slack alerts
+Create an incoming webhook for the operations channel, store it in Secret Manager, and expose it to both functions:
+
+- `SLACK_PATIENT_WEBHOOK_SECRET` – webhook name for patient sync failures (also used as the default channel for ROI failures)
+- `SLACK_ROI_WEBHOOK_SECRET` – optional override if ROIs should alert somewhere else
+
+When a patient contact or ROI object keeps failing after five retries, the function posts a summary (natural key, IDs, last status, timestamp) to the configured channel.
 
 ### Cloud Functions
 Deploy two HTTP functions:
