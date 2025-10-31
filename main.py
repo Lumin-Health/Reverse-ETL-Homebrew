@@ -372,6 +372,20 @@ def upsert_id_map(bq: bigquery.Client, obj_type: str, natural_key: str, hubspot_
     )).result()
     log("id_map_upsert_complete", object_type=obj_type, natural_key=natural_key)
 
+def delete_id_map(bq: bigquery.Client, obj_type: str, natural_key: str):
+    log("id_map_delete_start", object_type=obj_type, natural_key=natural_key)
+    q = f"""
+      DELETE FROM `{ID_MAP_TABLE}`
+      WHERE hubspot_object_type = @obj_type AND natural_key = @natural_key
+    """
+    bq.query(q, job_config=bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("obj_type","STRING",obj_type),
+            bigquery.ScalarQueryParameter("natural_key","STRING",natural_key),
+        ]
+    )).result()
+    log("id_map_delete_complete", object_type=obj_type, natural_key=natural_key)
+
 def get_mapped_hubspot_id(bq: bigquery.Client, obj_type: str, natural_key: str) -> Optional[str]:
     log("id_map_lookup_start", object_type=obj_type, natural_key=natural_key)
     q = f"""
@@ -479,8 +493,8 @@ class HubSpot:
             return None
         return data
 
-    def create_or_update_contact(self, properties: Dict[str,Any], hubspot_id: Optional[str]=None) -> Tuple[Optional[str], bool]:
-        """Returns (hubspot_id, created_bool)."""
+    def create_or_update_contact(self, properties: Dict[str,Any], hubspot_id: Optional[str]=None) -> Tuple[Optional[str], bool, Optional[int]]:
+        """Returns (hubspot_id, created_bool, status_code)."""
         if hubspot_id:
             status, data = self._request("PATCH", f"/crm/v3/objects/contacts/{hubspot_id}", json={"properties": properties})
             if status in (200, 201):
@@ -491,9 +505,9 @@ class HubSpot:
                         property_count=len(properties),
                         property_keys=list(properties.keys())
                     )
-                return data.get("id"), False
+                return data.get("id"), False, status
             log("hubspot_update_contact_error", status=status, data=data)
-            return None, False
+            return None, False, status
         else:
             status, data = self._request("POST", "/crm/v3/objects/contacts", json={"properties": properties})
             if status in (200, 201):
@@ -504,9 +518,9 @@ class HubSpot:
                         property_count=len(properties),
                         property_keys=list(properties.keys())
                     )
-                return data.get("id"), True
+                return data.get("id"), True, status
             log("hubspot_create_contact_error", status=status, data=data)
-            return None, False
+            return None, False, status
 
     # Generic custom object
     def search_custom(self, object_type: str, filters: List[Dict[str,Any]], properties: Optional[List[str]]=None) -> List[Dict[str,Any]]:
@@ -519,19 +533,19 @@ class HubSpot:
             return []
         return data.get("results", [])
 
-    def create_or_update_custom(self, object_type: str, properties: Dict[str,Any], hubspot_id: Optional[str]=None) -> Tuple[Optional[str], bool]:
+    def create_or_update_custom(self, object_type: str, properties: Dict[str,Any], hubspot_id: Optional[str]=None) -> Tuple[Optional[str], bool, Optional[int]]:
         if hubspot_id:
             status, data = self._request("PATCH", f"/crm/v3/objects/{object_type}/{hubspot_id}", json={"properties": properties})
             if status in (200, 201):
-                return data.get("id"), False
+                return data.get("id"), False, status
             log("hubspot_update_custom_error", status=status, object_type=object_type, data=data)
-            return None, False
+            return None, False, status
         else:
             status, data = self._request("POST", f"/crm/v3/objects/{object_type}", json={"properties": properties})
             if status in (200, 201):
-                return data.get("id"), True
+                return data.get("id"), True, status
             log("hubspot_create_custom_error", status=status, object_type=object_type, data=data)
-            return None, False
+            return None, False, status
 
     def get_custom(self, object_type: str, hubspot_id: str, properties: Optional[List[str]]=None) -> Optional[Dict[str,Any]]:
         params = {}
@@ -743,12 +757,26 @@ def upsert_contacts(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]])
                     log("contact_ambiguous_multiple", email_hash=hash8(props["email"]), count=len(results))
                     continue
             # upsert
-            obj_id, created_flag = hs.create_or_update_contact(props, hubspot_id)
-            if obj_id:
-                upsert_id_map(bq, "contacts", natural_key, obj_id)
-                if created_flag: created += 1
-                else: updated += 1
-            else:
+            attempts_left = 2
+            current_hubspot_id = hubspot_id
+            while attempts_left > 0:
+                obj_id, created_flag, status_code = hs.create_or_update_contact(props, current_hubspot_id)
+                if obj_id:
+                    upsert_id_map(bq, "contacts", natural_key, obj_id)
+                    if created_flag: created += 1
+                    else: updated += 1
+                    break
+                if status_code == 404 and current_hubspot_id:
+                    delete_id_map(bq, "contacts", natural_key)
+                    log(
+                        "id_map_stale_removed",
+                        object_type="contacts",
+                        natural_key=natural_key,
+                        stale_hubspot_id=current_hubspot_id,
+                    )
+                    current_hubspot_id = None
+                    attempts_left -= 1
+                    continue
                 attempts = read_failure_attempts(bq, "patients", natural_key, "create_or_update_failed") + 1
                 write_dlq(bq, "patients", natural_key, "contacts", props, "create_or_update_failed", attempts)
                 if attempts >= 5:
@@ -763,6 +791,7 @@ def upsert_contacts(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]])
                         f"*Timestamp:* {timestamp}",
                         DEFAULT_SLACK_WEBHOOK_SECRET_NAME,
                     )
+                break
     log("upsert_contacts_complete", total=len(rows), created=created, updated=updated, skipped=skipped)
     return created, updated, skipped
 
@@ -821,13 +850,28 @@ def upsert_rois(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]]) -> 
                         skipped += 1
                         log("roi_manual_override_skip", natural_key=natural_key, hubspot_id=hubspot_id)
                         continue
-            obj_id, created_flag = hs.create_or_update_custom(ROI_OBJECT_TYPE, props, hubspot_id)
-            if obj_id:
-                upsert_id_map(bq, ROI_OBJECT_TYPE, natural_key, obj_id)
-                if created_flag: created += 1
-                else: updated += 1
-            else:
+            attempts_left = 2
+            current_hubspot_id = hubspot_id
+            while attempts_left > 0:
+                obj_id, created_flag, status_code = hs.create_or_update_custom(ROI_OBJECT_TYPE, props, current_hubspot_id)
+                if obj_id:
+                    upsert_id_map(bq, ROI_OBJECT_TYPE, natural_key, obj_id)
+                    if created_flag: created += 1
+                    else: updated += 1
+                    break
+                if status_code == 404 and current_hubspot_id:
+                    delete_id_map(bq, ROI_OBJECT_TYPE, natural_key)
+                    log(
+                        "id_map_stale_removed",
+                        object_type=ROI_OBJECT_TYPE,
+                        natural_key=natural_key,
+                        stale_hubspot_id=current_hubspot_id,
+                    )
+                    current_hubspot_id = None
+                    attempts_left -= 1
+                    continue
                 write_dlq(bq, "rois", natural_key, ROI_OBJECT_TYPE, props, "create_or_update_failed", 1)
+                break
     log("upsert_rois_complete", total=len(rows), created=created, updated=updated, skipped=skipped)
     return created, updated, skipped
 
