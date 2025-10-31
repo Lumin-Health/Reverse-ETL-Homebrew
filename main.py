@@ -133,6 +133,48 @@ def to_hubspot_bool(value: Any) -> Optional[str]:
         return normalized
     return str(value).strip().lower() or None
 
+def prune_missing_properties(
+    props: Dict[str, Any],
+    response_data: Optional[Dict[str, Any]],
+    job_type: str,
+    object_type: str,
+    natural_key: str,
+) -> bool:
+    if not response_data:
+        return False
+    errors = response_data.get("errors") or []
+    missing: List[str] = []
+    for err in errors:
+        if err.get("code") != "PROPERTY_DOESNT_EXIST":
+            continue
+        context_names = err.get("context", {}).get("propertyName") or []
+        if not context_names and err.get("name"):
+            context_names = [err["name"]]
+        for name in context_names:
+            if name in props and name not in missing:
+                missing.append(name)
+    if not missing:
+        return False
+    for name in missing:
+        props.pop(name, None)
+    hashed_key = hash8(natural_key)
+    log(
+        "hubspot_property_missing_skipped",
+        job_type=job_type,
+        object_type=object_type,
+        natural_key_hash=hashed_key,
+        properties=missing,
+    )
+    if AMD_SYNC_LOCK_PROP in missing:
+        log(
+            "hubspot_lock_property_missing",
+            job_type=job_type,
+            object_type=object_type,
+            natural_key_hash=hashed_key,
+            property=AMD_SYNC_LOCK_PROP,
+        )
+    return True
+
 def to_epoch_millis(value: Any) -> Optional[int]:
     if value in (None, "",):
         return None
@@ -493,8 +535,8 @@ class HubSpot:
             return None
         return data
 
-    def create_or_update_contact(self, properties: Dict[str,Any], hubspot_id: Optional[str]=None) -> Tuple[Optional[str], bool, Optional[int]]:
-        """Returns (hubspot_id, created_bool, status_code)."""
+    def create_or_update_contact(self, properties: Dict[str,Any], hubspot_id: Optional[str]=None) -> Tuple[Optional[str], bool, Optional[int], Optional[Dict[str,Any]]]:
+        """Returns (hubspot_id, created_bool, status_code, response_body)."""
         if hubspot_id:
             status, data = self._request("PATCH", f"/crm/v3/objects/contacts/{hubspot_id}", json={"properties": properties})
             if status in (200, 201):
@@ -505,9 +547,9 @@ class HubSpot:
                         property_count=len(properties),
                         property_keys=list(properties.keys())
                     )
-                return data.get("id"), False, status
+                return data.get("id"), False, status, data
             log("hubspot_update_contact_error", status=status, data=data)
-            return None, False, status
+            return None, False, status, data
         else:
             status, data = self._request("POST", "/crm/v3/objects/contacts", json={"properties": properties})
             if status in (200, 201):
@@ -518,9 +560,9 @@ class HubSpot:
                         property_count=len(properties),
                         property_keys=list(properties.keys())
                     )
-                return data.get("id"), True, status
+                return data.get("id"), True, status, data
             log("hubspot_create_contact_error", status=status, data=data)
-            return None, False, status
+            return None, False, status, data
 
     # Generic custom object
     def search_custom(self, object_type: str, filters: List[Dict[str,Any]], properties: Optional[List[str]]=None) -> List[Dict[str,Any]]:
@@ -533,19 +575,19 @@ class HubSpot:
             return []
         return data.get("results", [])
 
-    def create_or_update_custom(self, object_type: str, properties: Dict[str,Any], hubspot_id: Optional[str]=None) -> Tuple[Optional[str], bool, Optional[int]]:
+    def create_or_update_custom(self, object_type: str, properties: Dict[str,Any], hubspot_id: Optional[str]=None) -> Tuple[Optional[str], bool, Optional[int], Optional[Dict[str,Any]]]:
         if hubspot_id:
             status, data = self._request("PATCH", f"/crm/v3/objects/{object_type}/{hubspot_id}", json={"properties": properties})
             if status in (200, 201):
-                return data.get("id"), False, status
+                return data.get("id"), False, status, data
             log("hubspot_update_custom_error", status=status, object_type=object_type, data=data)
-            return None, False, status
+            return None, False, status, data
         else:
             status, data = self._request("POST", f"/crm/v3/objects/{object_type}", json={"properties": properties})
             if status in (200, 201):
-                return data.get("id"), True, status
+                return data.get("id"), True, status, data
             log("hubspot_create_custom_error", status=status, object_type=object_type, data=data)
-            return None, False, status
+            return None, False, status, data
 
     def get_custom(self, object_type: str, hubspot_id: str, properties: Optional[List[str]]=None) -> Optional[Dict[str,Any]]:
         params = {}
@@ -760,7 +802,7 @@ def upsert_contacts(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]])
             attempts_left = 2
             current_hubspot_id = hubspot_id
             while attempts_left > 0:
-                obj_id, created_flag, status_code = hs.create_or_update_contact(props, current_hubspot_id)
+                obj_id, created_flag, status_code, response_data = hs.create_or_update_contact(props, current_hubspot_id)
                 if obj_id:
                     upsert_id_map(bq, "contacts", natural_key, obj_id)
                     if created_flag: created += 1
@@ -775,6 +817,9 @@ def upsert_contacts(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]])
                         stale_hubspot_id=current_hubspot_id,
                     )
                     current_hubspot_id = None
+                    attempts_left -= 1
+                    continue
+                if status_code == 400 and prune_missing_properties(props, response_data, "patients", "contacts", natural_key):
                     attempts_left -= 1
                     continue
                 attempts = read_failure_attempts(bq, "patients", natural_key, "create_or_update_failed") + 1
@@ -853,7 +898,7 @@ def upsert_rois(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]]) -> 
             attempts_left = 2
             current_hubspot_id = hubspot_id
             while attempts_left > 0:
-                obj_id, created_flag, status_code = hs.create_or_update_custom(ROI_OBJECT_TYPE, props, current_hubspot_id)
+                obj_id, created_flag, status_code, response_data = hs.create_or_update_custom(ROI_OBJECT_TYPE, props, current_hubspot_id)
                 if obj_id:
                     upsert_id_map(bq, ROI_OBJECT_TYPE, natural_key, obj_id)
                     if created_flag: created += 1
@@ -868,6 +913,9 @@ def upsert_rois(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]]) -> 
                         stale_hubspot_id=current_hubspot_id,
                     )
                     current_hubspot_id = None
+                    attempts_left -= 1
+                    continue
+                if status_code == 400 and prune_missing_properties(props, response_data, "rois", ROI_OBJECT_TYPE, natural_key):
                     attempts_left -= 1
                     continue
                 write_dlq(bq, "rois", natural_key, ROI_OBJECT_TYPE, props, "create_or_update_failed", 1)
