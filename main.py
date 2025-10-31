@@ -51,8 +51,6 @@ HUBSPOT_TIMEOUT = int(os.getenv("HUBSPOT_TIMEOUT", "20"))
 BATCH_SIZE      = int(os.getenv("BATCH_SIZE", "50"))
 MAX_RETRIES     = int(os.getenv("MAX_RETRIES", "5"))
 INITIAL_BACKOFF = float(os.getenv("INITIAL_BACKOFF", "0.5"))
-LOG_PROPERTY_DROPS = os.getenv("LOG_PROPERTY_DROPS", "false").lower() == "true"
-LOG_HUBSPOT_UPSERTS = os.getenv("LOG_HUBSPOT_UPSERTS", "false").lower() == "true"
 
 # Object type names (adjust if your portal uses different custom object names)
 ROI_OBJECT_TYPE = os.getenv("ROI_OBJECT_TYPE", "p_roi")  # example: "p_roi"
@@ -132,48 +130,6 @@ def to_hubspot_bool(value: Any) -> Optional[str]:
             return "false"
         return normalized
     return str(value).strip().lower() or None
-
-def prune_missing_properties(
-    props: Dict[str, Any],
-    response_data: Optional[Dict[str, Any]],
-    job_type: str,
-    object_type: str,
-    natural_key: str,
-) -> bool:
-    if not response_data:
-        return False
-    errors = response_data.get("errors") or []
-    missing: List[str] = []
-    for err in errors:
-        if err.get("code") != "PROPERTY_DOESNT_EXIST":
-            continue
-        context_names = err.get("context", {}).get("propertyName") or []
-        if not context_names and err.get("name"):
-            context_names = [err["name"]]
-        for name in context_names:
-            if name in props and name not in missing:
-                missing.append(name)
-    if not missing:
-        return False
-    for name in missing:
-        props.pop(name, None)
-    hashed_key = hash8(natural_key)
-    log(
-        "hubspot_property_missing_skipped",
-        job_type=job_type,
-        object_type=object_type,
-        natural_key_hash=hashed_key,
-        properties=missing,
-    )
-    if AMD_SYNC_LOCK_PROP in missing:
-        log(
-            "hubspot_lock_property_missing",
-            job_type=job_type,
-            object_type=object_type,
-            natural_key_hash=hashed_key,
-            property=AMD_SYNC_LOCK_PROP,
-        )
-    return True
 
 def to_epoch_millis(value: Any) -> Optional[int]:
     if value in (None, "",):
@@ -414,20 +370,6 @@ def upsert_id_map(bq: bigquery.Client, obj_type: str, natural_key: str, hubspot_
     )).result()
     log("id_map_upsert_complete", object_type=obj_type, natural_key=natural_key)
 
-def delete_id_map(bq: bigquery.Client, obj_type: str, natural_key: str):
-    log("id_map_delete_start", object_type=obj_type, natural_key=natural_key)
-    q = f"""
-      DELETE FROM `{ID_MAP_TABLE}`
-      WHERE hubspot_object_type = @obj_type AND natural_key = @natural_key
-    """
-    bq.query(q, job_config=bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("obj_type","STRING",obj_type),
-            bigquery.ScalarQueryParameter("natural_key","STRING",natural_key),
-        ]
-    )).result()
-    log("id_map_delete_complete", object_type=obj_type, natural_key=natural_key)
-
 def get_mapped_hubspot_id(bq: bigquery.Client, obj_type: str, natural_key: str) -> Optional[str]:
     log("id_map_lookup_start", object_type=obj_type, natural_key=natural_key)
     q = f"""
@@ -535,34 +477,20 @@ class HubSpot:
             return None
         return data
 
-    def create_or_update_contact(self, properties: Dict[str,Any], hubspot_id: Optional[str]=None) -> Tuple[Optional[str], bool, Optional[int], Optional[Dict[str,Any]]]:
-        """Returns (hubspot_id, created_bool, status_code, response_body)."""
+    def create_or_update_contact(self, properties: Dict[str,Any], hubspot_id: Optional[str]=None) -> Tuple[Optional[str], bool]:
+        """Returns (hubspot_id, created_bool)."""
         if hubspot_id:
             status, data = self._request("PATCH", f"/crm/v3/objects/contacts/{hubspot_id}", json={"properties": properties})
             if status in (200, 201):
-                if LOG_HUBSPOT_UPSERTS:
-                    log(
-                        "hubspot_contact_update_ok",
-                        hubspot_id=hubspot_id,
-                        property_count=len(properties),
-                        property_keys=list(properties.keys())
-                    )
-                return data.get("id"), False, status, data
+                return data.get("id"), False
             log("hubspot_update_contact_error", status=status, data=data)
-            return None, False, status, data
+            return None, False
         else:
             status, data = self._request("POST", "/crm/v3/objects/contacts", json={"properties": properties})
             if status in (200, 201):
-                if LOG_HUBSPOT_UPSERTS:
-                    log(
-                        "hubspot_contact_create_ok",
-                        hubspot_id=data.get("id"),
-                        property_count=len(properties),
-                        property_keys=list(properties.keys())
-                    )
-                return data.get("id"), True, status, data
+                return data.get("id"), True
             log("hubspot_create_contact_error", status=status, data=data)
-            return None, False, status, data
+            return None, False
 
     # Generic custom object
     def search_custom(self, object_type: str, filters: List[Dict[str,Any]], properties: Optional[List[str]]=None) -> List[Dict[str,Any]]:
@@ -575,19 +503,19 @@ class HubSpot:
             return []
         return data.get("results", [])
 
-    def create_or_update_custom(self, object_type: str, properties: Dict[str,Any], hubspot_id: Optional[str]=None) -> Tuple[Optional[str], bool, Optional[int], Optional[Dict[str,Any]]]:
+    def create_or_update_custom(self, object_type: str, properties: Dict[str,Any], hubspot_id: Optional[str]=None) -> Tuple[Optional[str], bool]:
         if hubspot_id:
             status, data = self._request("PATCH", f"/crm/v3/objects/{object_type}/{hubspot_id}", json={"properties": properties})
             if status in (200, 201):
-                return data.get("id"), False, status, data
+                return data.get("id"), False
             log("hubspot_update_custom_error", status=status, object_type=object_type, data=data)
-            return None, False, status, data
+            return None, False
         else:
             status, data = self._request("POST", f"/crm/v3/objects/{object_type}", json={"properties": properties})
             if status in (200, 201):
-                return data.get("id"), True, status, data
+                return data.get("id"), True
             log("hubspot_create_custom_error", status=status, object_type=object_type, data=data)
-            return None, False, status, data
+            return None, False
 
     def get_custom(self, object_type: str, hubspot_id: str, properties: Optional[List[str]]=None) -> Optional[Dict[str,Any]]:
         params = {}
@@ -605,13 +533,10 @@ class HubSpot:
 
 def fetch_rows(bq: bigquery.Client, table: str, updated_col: str, watermark: Optional[datetime]) -> List[Dict[str,Any]]:
     log("fetch_rows_start", table=table, delta=bool(watermark), watermark=str(watermark) if watermark else None)
-    normalized_col = (updated_col or "").strip()
-    if watermark and normalized_col:
-        q = f"SELECT * FROM `{table}` WHERE {normalized_col} >= @wm"
+    if watermark:
+        q = f"SELECT * FROM `{table}` WHERE {updated_col} >= @wm"
         params = [bigquery.ScalarQueryParameter("wm","TIMESTAMP", watermark)]
     else:
-        if watermark and not normalized_col:
-            log("fetch_rows_fullscan_no_delta", table=table)
         q = f"SELECT * FROM `{table}`"
         params = []
     try:
@@ -644,7 +569,7 @@ def map_patient_to_contact(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
     first_treatment = row.get("FirstTreatment") or row.get("FirstInitialConsult")
     started_flag = to_hubspot_bool(row.get("Started"))
     active_flag = to_hubspot_bool(row.get("Active"))
-    raw_props = {
+    props = {
         "email": (row.get("Email") or "").strip().lower() or None,
         "firstname": row.get("FirstName"),
         "preferred_first_name": row.get("PreferredFirstName"),
@@ -678,20 +603,11 @@ def map_patient_to_contact(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
         "lifecyclestage": "customer",
     }
     # add AMD lock flag default false; will be set to true once synced
-    raw_props[AMD_SYNC_LOCK_PROP] = True
+    props[AMD_SYNC_LOCK_PROP] = True
     if PATIENT_NATURAL_ID_PROP:
-        raw_props[PATIENT_NATURAL_ID_PROP] = natural_key
-    props: Dict[str, Any] = {}
-    dropped: List[str] = []
-    for key, value in raw_props.items():
-        cleaned = clean_value(value)
-        if cleaned in (None, ""):
-            if value not in (None, ""):
-                dropped.append(key)
-            continue
-        props[key] = cleaned
-    if LOG_PROPERTY_DROPS and dropped:
-        log("patient_props_dropped", natural_key=hash8(natural_key), fields=dropped)
+        props[PATIENT_NATURAL_ID_PROP] = natural_key
+    # Drop Nones/blank strings and coerce Decimal/Datetime to JSON-safe values
+    props = {k: clean_value(v) for k,v in props.items() if v not in (None,"")}
     return natural_key, props
 
 def find_patient_contact(bq: bigquery.Client, hs: HubSpot, patient_id: Any, patient_chart: Any) -> Optional[str]:
@@ -721,7 +637,7 @@ def map_roi_to_custom(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
     natural_key = roi_id or str(row.get("ID") or hash8(json.dumps(row)))
     patient_id = format_identifier(row.get("PatientID"))
     patient_chart = format_identifier(row.get("PatientChart"))
-    raw_props = {
+    props = {
         "roi_type": row.get("TemplateName"),
         "patient_chart": patient_chart,
         "raw_provider_name": row.get("ProviderName"),
@@ -737,17 +653,7 @@ def map_roi_to_custom(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
         "amd_template_id": row.get("TemplateID"),
         "roi_id": roi_id,
     }
-    props: Dict[str, Any] = {}
-    dropped: List[str] = []
-    for key, value in raw_props.items():
-        cleaned = clean_value(value)
-        if cleaned in (None, ""):
-            if value not in (None, ""):
-                dropped.append(key)
-            continue
-        props[key] = cleaned
-    if LOG_PROPERTY_DROPS and dropped:
-        log("roi_props_dropped", natural_key=hash8(natural_key), fields=dropped)
+    props = {k: clean_value(v) for k,v in props.items() if v not in (None,"")}
     for protected in ROI_PROTECTED_PROPERTIES:
         props.pop(protected, None)
     if ROI_NATURAL_ID_PROP:
@@ -799,29 +705,12 @@ def upsert_contacts(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]])
                     log("contact_ambiguous_multiple", email_hash=hash8(props["email"]), count=len(results))
                     continue
             # upsert
-            attempts_left = 2
-            current_hubspot_id = hubspot_id
-            while attempts_left > 0:
-                obj_id, created_flag, status_code, response_data = hs.create_or_update_contact(props, current_hubspot_id)
-                if obj_id:
-                    upsert_id_map(bq, "contacts", natural_key, obj_id)
-                    if created_flag: created += 1
-                    else: updated += 1
-                    break
-                if status_code == 404 and current_hubspot_id:
-                    delete_id_map(bq, "contacts", natural_key)
-                    log(
-                        "id_map_stale_removed",
-                        object_type="contacts",
-                        natural_key=natural_key,
-                        stale_hubspot_id=current_hubspot_id,
-                    )
-                    current_hubspot_id = None
-                    attempts_left -= 1
-                    continue
-                if status_code == 400 and prune_missing_properties(props, response_data, "patients", "contacts", natural_key):
-                    attempts_left -= 1
-                    continue
+            obj_id, created_flag = hs.create_or_update_contact(props, hubspot_id)
+            if obj_id:
+                upsert_id_map(bq, "contacts", natural_key, obj_id)
+                if created_flag: created += 1
+                else: updated += 1
+            else:
                 attempts = read_failure_attempts(bq, "patients", natural_key, "create_or_update_failed") + 1
                 write_dlq(bq, "patients", natural_key, "contacts", props, "create_or_update_failed", attempts)
                 if attempts >= 5:
@@ -836,7 +725,6 @@ def upsert_contacts(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]])
                         f"*Timestamp:* {timestamp}",
                         DEFAULT_SLACK_WEBHOOK_SECRET_NAME,
                     )
-                break
     log("upsert_contacts_complete", total=len(rows), created=created, updated=updated, skipped=skipped)
     return created, updated, skipped
 
@@ -895,31 +783,13 @@ def upsert_rois(bq: bigquery.Client, hs: HubSpot, rows: List[Dict[str,Any]]) -> 
                         skipped += 1
                         log("roi_manual_override_skip", natural_key=natural_key, hubspot_id=hubspot_id)
                         continue
-            attempts_left = 2
-            current_hubspot_id = hubspot_id
-            while attempts_left > 0:
-                obj_id, created_flag, status_code, response_data = hs.create_or_update_custom(ROI_OBJECT_TYPE, props, current_hubspot_id)
-                if obj_id:
-                    upsert_id_map(bq, ROI_OBJECT_TYPE, natural_key, obj_id)
-                    if created_flag: created += 1
-                    else: updated += 1
-                    break
-                if status_code == 404 and current_hubspot_id:
-                    delete_id_map(bq, ROI_OBJECT_TYPE, natural_key)
-                    log(
-                        "id_map_stale_removed",
-                        object_type=ROI_OBJECT_TYPE,
-                        natural_key=natural_key,
-                        stale_hubspot_id=current_hubspot_id,
-                    )
-                    current_hubspot_id = None
-                    attempts_left -= 1
-                    continue
-                if status_code == 400 and prune_missing_properties(props, response_data, "rois", ROI_OBJECT_TYPE, natural_key):
-                    attempts_left -= 1
-                    continue
+            obj_id, created_flag = hs.create_or_update_custom(ROI_OBJECT_TYPE, props, hubspot_id)
+            if obj_id:
+                upsert_id_map(bq, ROI_OBJECT_TYPE, natural_key, obj_id)
+                if created_flag: created += 1
+                else: updated += 1
+            else:
                 write_dlq(bq, "rois", natural_key, ROI_OBJECT_TYPE, props, "create_or_update_failed", 1)
-                break
     log("upsert_rois_complete", total=len(rows), created=created, updated=updated, skipped=skipped)
     return created, updated, skipped
 
@@ -948,14 +818,6 @@ def run_job(job_type: str):
 
     started = now_utc()
     watermark = read_high_watermark(bq, job_type)
-    if job_type == "patients" and not (PATIENT_UPDATED_AT_COL or "").strip():
-        if watermark:
-            log("watermark_ignored_no_patient_delta", watermark=str(watermark))
-        watermark = None
-    if job_type == "rois" and not (ROI_UPDATED_AT_COL or "").strip():
-        if watermark:
-            log("watermark_ignored_no_roi_delta", watermark=str(watermark))
-        watermark = None
     read = created = updated = skipped = errors = 0
 
     try:
