@@ -549,10 +549,13 @@ class HubSpot:
 
 def fetch_rows(bq: bigquery.Client, table: str, updated_col: str, watermark: Optional[datetime]) -> List[Dict[str,Any]]:
     log("fetch_rows_start", table=table, delta=bool(watermark), watermark=str(watermark) if watermark else None)
-    if watermark:
-        q = f"SELECT * FROM `{table}` WHERE {updated_col} >= @wm"
+    normalized_col = (updated_col or "").strip()
+    if watermark and normalized_col:
+        q = f"SELECT * FROM `{table}` WHERE {normalized_col} >= @wm"
         params = [bigquery.ScalarQueryParameter("wm","TIMESTAMP", watermark)]
     else:
+        if watermark and not normalized_col:
+            log("fetch_rows_fullscan_no_delta", table=table)
         q = f"SELECT * FROM `{table}`"
         params = []
     try:
@@ -853,6 +856,14 @@ def run_job(job_type: str):
 
     started = now_utc()
     watermark = read_high_watermark(bq, job_type)
+    if job_type == "patients" and not (PATIENT_UPDATED_AT_COL or "").strip():
+        if watermark:
+            log("watermark_ignored_no_patient_delta", watermark=str(watermark))
+        watermark = None
+    if job_type == "rois" and not (ROI_UPDATED_AT_COL or "").strip():
+        if watermark:
+            log("watermark_ignored_no_roi_delta", watermark=str(watermark))
+        watermark = None
     read = created = updated = skipped = errors = 0
 
     try:
