@@ -51,6 +51,8 @@ HUBSPOT_TIMEOUT = int(os.getenv("HUBSPOT_TIMEOUT", "20"))
 BATCH_SIZE      = int(os.getenv("BATCH_SIZE", "50"))
 MAX_RETRIES     = int(os.getenv("MAX_RETRIES", "5"))
 INITIAL_BACKOFF = float(os.getenv("INITIAL_BACKOFF", "0.5"))
+LOG_PROPERTY_DROPS = os.getenv("LOG_PROPERTY_DROPS", "false").lower() == "true"
+LOG_HUBSPOT_UPSERTS = os.getenv("LOG_HUBSPOT_UPSERTS", "false").lower() == "true"
 
 # Object type names (adjust if your portal uses different custom object names)
 ROI_OBJECT_TYPE = os.getenv("ROI_OBJECT_TYPE", "p_roi")  # example: "p_roi"
@@ -107,7 +109,29 @@ def clean_value(value: Any) -> Any:
         if value.tzinfo:
             return value.astimezone(EASTERN_TZ).isoformat()
         return value.replace(tzinfo=timezone.utc).astimezone(EASTERN_TZ).isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
     return value
+
+def to_hubspot_bool(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, Decimal)):
+        return "true" if value != 0 else "false"
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        if normalized in {"true", "false"}:
+            return normalized
+        if normalized in {"1", "y", "yes", "t"}:
+            return "true"
+        if normalized in {"0", "n", "no", "f"}:
+            return "false"
+        return normalized
+    return str(value).strip().lower() or None
 
 def to_epoch_millis(value: Any) -> Optional[int]:
     if value in (None, "",):
@@ -185,13 +209,18 @@ def format_identifier(value: Any) -> Optional[str]:
         return None
     if isinstance(value, Decimal):
         if value == value.to_integral_value():
-            return str(int(value))
-        return format(value.normalize(), 'f').rstrip('0').rstrip('.')
-    if isinstance(value, float):
+            formatted = str(int(value))
+        else:
+            formatted = format(value.normalize(), 'f').rstrip('0').rstrip('.')
+    elif isinstance(value, float):
         if value.is_integer():
-            return str(int(value))
-        return str(value)
-    return str(value)
+            formatted = str(int(value))
+        else:
+            formatted = str(value)
+    else:
+        formatted = str(value)
+    formatted = formatted.strip()
+    return formatted or None
 
 # -------------------------
 # Secret Manager
@@ -455,12 +484,26 @@ class HubSpot:
         if hubspot_id:
             status, data = self._request("PATCH", f"/crm/v3/objects/contacts/{hubspot_id}", json={"properties": properties})
             if status in (200, 201):
+                if LOG_HUBSPOT_UPSERTS:
+                    log(
+                        "hubspot_contact_update_ok",
+                        hubspot_id=hubspot_id,
+                        property_count=len(properties),
+                        property_keys=list(properties.keys())
+                    )
                 return data.get("id"), False
             log("hubspot_update_contact_error", status=status, data=data)
             return None, False
         else:
             status, data = self._request("POST", "/crm/v3/objects/contacts", json={"properties": properties})
             if status in (200, 201):
+                if LOG_HUBSPOT_UPSERTS:
+                    log(
+                        "hubspot_contact_create_ok",
+                        hubspot_id=data.get("id"),
+                        property_count=len(properties),
+                        property_keys=list(properties.keys())
+                    )
                 return data.get("id"), True
             log("hubspot_create_contact_error", status=status, data=data)
             return None, False
@@ -540,7 +583,9 @@ def map_patient_to_contact(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
     next_treatment = row.get("NextTreatment")
     next_follow_up = row.get("NextFollowUp")
     first_treatment = row.get("FirstTreatment") or row.get("FirstInitialConsult")
-    props = {
+    started_flag = to_hubspot_bool(row.get("Started"))
+    active_flag = to_hubspot_bool(row.get("Active"))
+    raw_props = {
         "email": (row.get("Email") or "").strip().lower() or None,
         "firstname": row.get("FirstName"),
         "preferred_first_name": row.get("PreferredFirstName"),
@@ -568,17 +613,26 @@ def map_patient_to_contact(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
         "next_treatment_date": to_eastern_date_string(next_treatment or row.get("MaxScheduledTreatment")),
         "next_follow_up_date": to_eastern_date_string(next_follow_up),
         "first_initial_consult__treatment_": to_epoch_millis(first_treatment),
-        "started": row.get("Started"),
-        "active_treatment": row.get("Active"),
+        "started": started_flag,
+        "active_treatment": active_flag,
         "care_type": row.get("CareType"),
         "lifecyclestage": "customer",
     }
     # add AMD lock flag default false; will be set to true once synced
-    props[AMD_SYNC_LOCK_PROP] = True
+    raw_props[AMD_SYNC_LOCK_PROP] = True
     if PATIENT_NATURAL_ID_PROP:
-        props[PATIENT_NATURAL_ID_PROP] = natural_key
-    # Drop Nones/blank strings and coerce Decimal/Datetime to JSON-safe values
-    props = {k: clean_value(v) for k,v in props.items() if v not in (None,"")}
+        raw_props[PATIENT_NATURAL_ID_PROP] = natural_key
+    props: Dict[str, Any] = {}
+    dropped: List[str] = []
+    for key, value in raw_props.items():
+        cleaned = clean_value(value)
+        if cleaned in (None, ""):
+            if value not in (None, ""):
+                dropped.append(key)
+            continue
+        props[key] = cleaned
+    if LOG_PROPERTY_DROPS and dropped:
+        log("patient_props_dropped", natural_key=hash8(natural_key), fields=dropped)
     return natural_key, props
 
 def find_patient_contact(bq: bigquery.Client, hs: HubSpot, patient_id: Any, patient_chart: Any) -> Optional[str]:
@@ -608,7 +662,7 @@ def map_roi_to_custom(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
     natural_key = roi_id or str(row.get("ID") or hash8(json.dumps(row)))
     patient_id = format_identifier(row.get("PatientID"))
     patient_chart = format_identifier(row.get("PatientChart"))
-    props = {
+    raw_props = {
         "roi_type": row.get("TemplateName"),
         "patient_chart": patient_chart,
         "raw_provider_name": row.get("ProviderName"),
@@ -624,7 +678,17 @@ def map_roi_to_custom(row: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
         "amd_template_id": row.get("TemplateID"),
         "roi_id": roi_id,
     }
-    props = {k: clean_value(v) for k,v in props.items() if v not in (None,"")}
+    props: Dict[str, Any] = {}
+    dropped: List[str] = []
+    for key, value in raw_props.items():
+        cleaned = clean_value(value)
+        if cleaned in (None, ""):
+            if value not in (None, ""):
+                dropped.append(key)
+            continue
+        props[key] = cleaned
+    if LOG_PROPERTY_DROPS and dropped:
+        log("roi_props_dropped", natural_key=hash8(natural_key), fields=dropped)
     for protected in ROI_PROTECTED_PROPERTIES:
         props.pop(protected, None)
     if ROI_NATURAL_ID_PROP:
